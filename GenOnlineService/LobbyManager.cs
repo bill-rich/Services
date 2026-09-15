@@ -593,6 +593,10 @@ namespace GenOnlineService
 
 		public UInt16 MaximumCameraHeight { get; private set; } = GenOnlineService.Constants.g_DefaultCameraMaxHeight;
 
+		// Resume-from-replay arming (see HOST_ACTION_ARM_RESUME). Empty when not armed.
+		public string ResumeReplayFile { get; private set; } = String.Empty;
+		public UInt32 ResumeHandoffFrame { get; private set; } = 0;
+
         [JsonIgnore] // This is not serialized as the client doesn't need to know, the service checks it
         public ELobbyJoinability LobbyJoinability { get; private set; } = ELobbyJoinability.Public; // public by default
 
@@ -1516,6 +1520,28 @@ public async Task FinalizeACChecks()
 				MaximumCameraHeight = maxCamHeight;
 				DirtyRetransmit();
 			}
+		}
+
+		public void UpdateResumeArm(string replayFile, UInt32 handoffFrame, int rngSeed)
+		{
+			if (replayFile.Length > 64)
+			{
+				return; // replay names are short fixed-form file names, refuse anything else
+			}
+
+			if (replayFile.Length == 0)
+			{
+				// disarm; the seed stays whatever it is, the next start is a fresh game
+				ResumeReplayFile = String.Empty;
+				ResumeHandoffFrame = 0;
+			}
+			else
+			{
+				ResumeReplayFile = replayFile;
+				ResumeHandoffFrame = handoffFrame;
+				RNGSeed = rngSeed;
+			}
+			DirtyRetransmit();
 		}
 
 		public void ResetReadyStates()

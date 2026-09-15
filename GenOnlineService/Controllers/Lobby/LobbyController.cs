@@ -134,7 +134,8 @@ namespace GenOnlineService.Controllers
 		AI_START_POS = 16,
 		MAX_CAMERA_HEIGHT = 17,
         JOINABILITY = 18,
-		HOST_ACTION_BULK_SLOT_UPDATE = 19
+		HOST_ACTION_BULK_SLOT_UPDATE = 19,
+		HOST_ACTION_ARM_RESUME = 20
     };
 
 	public class RouteHandler_PUT_Lobby_Result : APIResult
@@ -402,7 +403,8 @@ namespace GenOnlineService.Controllers
 			[ELobbyUpdateField.AI_START_POS] = ELobbyUpdatePermissions.LobbyOwner,
 			[ELobbyUpdateField.MAX_CAMERA_HEIGHT] = ELobbyUpdatePermissions.LobbyOwner,
 			[ELobbyUpdateField.JOINABILITY] = ELobbyUpdatePermissions.LobbyOwner,
-			[ELobbyUpdateField.HOST_ACTION_BULK_SLOT_UPDATE] = ELobbyUpdatePermissions.LobbyOwner
+			[ELobbyUpdateField.HOST_ACTION_BULK_SLOT_UPDATE] = ELobbyUpdatePermissions.LobbyOwner,
+			[ELobbyUpdateField.HOST_ACTION_ARM_RESUME] = ELobbyUpdatePermissions.LobbyOwner
 		};
 
 
@@ -735,6 +737,21 @@ namespace GenOnlineService.Controllers
 											}
 										}
 										lobby.DirtyRetransmit();
+									}
+								}
+								else if (field == ELobbyUpdateField.HOST_ACTION_ARM_RESUME)
+								{
+									// Resume-from-replay: the host arms a replay every member holds a copy of.
+									// The client replays it in lockstep up to handoff_frame on game start, so the
+									// lobby must start from the replay's seed. An empty replay_file disarms.
+									if (data.ContainsKey("replay_file")
+										&& data.ContainsKey("handoff_frame")
+										&& data.ContainsKey("rng_seed"))
+									{
+										string replayFile = data["replay_file"].GetString() ?? String.Empty;
+										UInt32 handoffFrame = data["handoff_frame"].GetUInt32();
+										int rngSeed = data["rng_seed"].GetInt32();
+										lobby.UpdateResumeArm(replayFile, handoffFrame, rngSeed);
 									}
 								}
                             }
