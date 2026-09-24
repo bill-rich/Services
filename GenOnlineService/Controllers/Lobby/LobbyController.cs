@@ -498,6 +498,23 @@ namespace GenOnlineService.Controllers
 									lobby.ResetReadyStates();
 								}
 
+								// Resume-from-replay: the recording fixes every slot's occupant, faction, color, start
+								// position and team (the map, cash and superweapon handlers disarm inside the lobby), so
+								// any slot change disarms. The host re-arms after fixing the lobby.
+								if (field == ELobbyUpdateField.MY_SIDE
+									|| field == ELobbyUpdateField.MY_COLOR
+									|| field == ELobbyUpdateField.MY_START_POS
+									|| field == ELobbyUpdateField.MY_TEAM
+									|| field == ELobbyUpdateField.AI_SIDE
+									|| field == ELobbyUpdateField.AI_COLOR
+									|| field == ELobbyUpdateField.AI_TEAM
+									|| field == ELobbyUpdateField.AI_START_POS
+									|| field == ELobbyUpdateField.HOST_ACTION_SET_SLOT_STATE
+									|| field == ELobbyUpdateField.HOST_ACTION_BULK_SLOT_UPDATE)
+								{
+									lobby.ClearResumeArm();
+								}
+
 								if (field == ELobbyUpdateField.LOBBY_MAP)
 								{
 									if (data.ContainsKey("map")
@@ -891,8 +908,21 @@ namespace GenOnlineService.Controllers
 				return result;
 			}
 
-			if (!lobby.AppendResumeReplay(offset, total, bytes, out long currentLength))
+			// the first chunk must open like a replay (RecorderClass writes the GENREP tag first)
+			if (offset == 0 && !Lobby.LooksLikeReplay(bytes))
 			{
+				Response.StatusCode = (int)HttpStatusCode.BadRequest;
+				return result;
+			}
+
+			if (!lobby.AppendResumeReplay(offset, total, bytes, out long currentLength, out bool bOverCapacity))
+			{
+				if (bOverCapacity)
+				{
+					// the service-wide budget for held resume replays is spent
+					Response.StatusCode = (int)HttpStatusCode.InsufficientStorage;
+					return result;
+				}
 				// offset disagreement (lost reply, duplicate send): tell the uploader where we really are
 				Response.StatusCode = (int)HttpStatusCode.Conflict;
 				result.total = currentLength;

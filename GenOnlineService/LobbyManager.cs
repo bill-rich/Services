@@ -596,8 +596,11 @@ namespace GenOnlineService
 		// Resume-from-replay arming (see HOST_ACTION_ARM_RESUME). 0 when not armed. Every client replays the
 		// same source, the host's upload (POST {lobbyID}/resume_replay), kept in memory with the lobby.
 		public UInt32 ResumeHandoffFrame { get; private set; } = 0;
+		public UInt32 ResumeReplayGeneration { get; private set; } = 0; // bumped on every arm, so guests can tell a fresh upload from the one they hold
 
 		public const long ResumeReplayMaxBytes = 16 * 1024 * 1024;
+		public const long ResumeReplayTotalCapBytes = 256L * 1024 * 1024; // across every lobby the service holds
+		private static long s_resumeReplayBytesInUse = 0;
 
 		[JsonIgnore] // the file is served by its own endpoint
 		private byte[] m_resumeReplayBytes = Array.Empty<byte>();
@@ -854,6 +857,7 @@ public async Task FinalizeACChecks()
 						Members[oldSlot] = new LobbyMember(this, null, -1, String.Empty, String.Empty, 0, -1, -1, -1, EPlayerType.SLOT_OPEN, oldSlot, true);
 
 						member.SetReadyState(true);
+						ClearResumeArm(); // the resume replay was the old host's; the new host arms its own if it wants to
 						DirtyRetransmitLobbyList();
 						break;
 					}
@@ -1479,6 +1483,9 @@ public async Task FinalizeACChecks()
 			// if start, init our AC probe
 			if (state == ELobbyState.INGAME)
 			{
+				// every client fetched its resume replay before pressing start; the bytes are dead weight from here
+				ReleaseResumeReplay();
+
 				// cache starting data, we use this later in replay/ss upload
 				GetParticipantBreakdown(out int numHumans, out int numAI, out int numOpen, out int numClosed);
 				m_cachedAtStart_numHumans = numHumans;
@@ -1559,6 +1566,7 @@ public async Task FinalizeACChecks()
 
 			ResumeHandoffFrame = handoffFrame;
 			RNGSeed = rngSeed;
+			++ResumeReplayGeneration;
 			foreach (LobbyMember member in Members)
 			{
 				member.UpdateHasResumeReplay(false, false);
@@ -1575,12 +1583,7 @@ public async Task FinalizeACChecks()
 		{
 			bool bWasArmed = ResumeHandoffFrame != 0;
 			ResumeHandoffFrame = 0;
-			lock (m_resumeReplayLock)
-			{
-				m_resumeReplayBytes = Array.Empty<byte>();
-				m_resumeReplayLength = 0;
-				m_resumeReplayTotal = 0;
-			}
+			ReleaseResumeReplay();
 			foreach (LobbyMember member in Members)
 			{
 				member.UpdateHasResumeReplay(false, false);
@@ -1592,25 +1595,66 @@ public async Task FinalizeACChecks()
 		}
 
 		/// <summary>
+		/// Drops the held resume source and gives its bytes back to the service-wide budget. The arm and
+		/// the members' flags are left alone: called on its own when the match starts (every client has
+		/// already fetched its copy and validates against the arm at start), and from ClearResumeArm.
+		/// </summary>
+		public void ReleaseResumeReplay()
+		{
+			lock (m_resumeReplayLock)
+			{
+				if (m_resumeReplayBytes.Length > 0)
+				{
+					Interlocked.Add(ref s_resumeReplayBytesInUse, -m_resumeReplayBytes.LongLength);
+				}
+				m_resumeReplayBytes = Array.Empty<byte>();
+				m_resumeReplayLength = 0;
+				m_resumeReplayTotal = 0;
+			}
+		}
+
+		/// <summary>The first bytes of a replay file are the GENREP tag.</summary>
+		public static bool LooksLikeReplay(byte[] bytes)
+		{
+			byte[] tag = System.Text.Encoding.ASCII.GetBytes("GENREP");
+			if (bytes.Length < tag.Length)
+			{
+				return false;
+			}
+			for (int i = 0; i < tag.Length; ++i)
+			{
+				if (bytes[i] != tag[i])
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		/// <summary>
 		/// Appends one chunk of the resume source. Offset 0 starts a new file of the given total size;
 		/// every later chunk must continue exactly where the previous one ended. Returns false with
 		/// the current length on an offset disagreement so the uploader can resume from there.
 		/// </summary>
-		public bool AppendResumeReplay(long offset, long total, byte[] bytes, out long currentLength)
+		public bool AppendResumeReplay(long offset, long total, byte[] bytes, out long currentLength, out bool bOverCapacity)
 		{
+			bOverCapacity = false;
 			lock (m_resumeReplayLock)
 			{
 				if (offset == 0)
 				{
-					if (total > ResumeReplayMaxBytes)
+					// a new source invalidates any arm: disarm properly (flags cleared, members told) and free the old file
+					ClearResumeArm();
+					if (Interlocked.Read(ref s_resumeReplayBytesInUse) + total > ResumeReplayTotalCapBytes)
 					{
-						currentLength = m_resumeReplayLength;
+						bOverCapacity = true;
+						currentLength = 0;
 						return false;
 					}
+					Interlocked.Add(ref s_resumeReplayBytesInUse, total);
 					m_resumeReplayBytes = new byte[total];
 					m_resumeReplayLength = 0;
 					m_resumeReplayTotal = total;
-					ResumeHandoffFrame = 0; // a new source invalidates any arm
 				}
 				if (offset != m_resumeReplayLength || total != m_resumeReplayTotal || offset + bytes.Length > m_resumeReplayTotal)
 				{
@@ -2169,6 +2213,7 @@ public async Task FinalizeACChecks()
 				await Database.MatchHistory.FinalizeAndScheduleExternalPublication(db, lobby);
 
 				// delete
+				lobby.ReleaseResumeReplay(); // give any held resume replay back to the service-wide budget
 				bool bRemoved = m_dictLobbies.Remove(lobby.LobbyID, out _);
 
 				if (bRemoved)
