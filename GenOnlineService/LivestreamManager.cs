@@ -28,8 +28,8 @@ namespace GenOnlineService
 	/// </summary>
 	public class Livestream
 	{
-		public const int BroadcastDelaySeconds = 60;
 		public const int MaxBytes = 32 * 1024 * 1024;
+		public int BroadcastDelaySeconds { get; private set; }
 
 		public Int64 LobbyID { get; private set; }
 		public Int64 StreamerUserID { get; private set; }
@@ -47,8 +47,9 @@ namespace GenOnlineService
 		// per chunk so a burst of frames does not leak early.
 		private readonly List<(long endOffset, DateTime arrived)> m_chunks = new();
 
-		public Livestream(Int64 lobbyID, Int64 streamerUserID, string name, string mapName, string mapPath, int players)
+		public Livestream(Int64 lobbyID, Int64 streamerUserID, string name, string mapName, string mapPath, int players, int broadcastDelaySeconds)
 		{
+			BroadcastDelaySeconds = broadcastDelaySeconds;
 			LobbyID = lobbyID;
 			StreamerUserID = streamerUserID;
 			Name = name;
@@ -148,8 +149,21 @@ namespace GenOnlineService
 	{
 		public const int StreamerSilenceTimeoutSeconds = 120;
 		public const int RetainAfterEndSeconds = 10 * 60;
+		public const int DefaultBroadcastDelaySeconds = 60;
 
 		private readonly ConcurrentDictionary<Int64, Livestream> m_streams = new();
+
+		/// <summary>Seconds a chunk is held before observers may read it; appsettings "Livestream:broadcast_delay_seconds".</summary>
+		public int BroadcastDelaySeconds { get; private set; } = DefaultBroadcastDelaySeconds;
+
+		public LivestreamManager()
+		{
+			int? configured = Program.g_Config?.GetSection("Livestream")?.GetValue<int?>("broadcast_delay_seconds");
+			if (configured.HasValue && configured.Value >= 0)
+			{
+				BroadcastDelaySeconds = configured.Value;
+			}
+		}
 
 		public Livestream? Get(Int64 lobbyID)
 		{
@@ -161,7 +175,7 @@ namespace GenOnlineService
 		public Livestream GetOrCreate(Int64 lobbyID, Int64 streamerUserID, string name, string mapName, string mapPath, int players)
 		{
 			Cleanup();
-			return m_streams.GetOrAdd(lobbyID, id => new Livestream(id, streamerUserID, name, mapName, mapPath, players));
+			return m_streams.GetOrAdd(lobbyID, id => new Livestream(id, streamerUserID, name, mapName, mapPath, players, BroadcastDelaySeconds));
 		}
 
 		public void Remove(Int64 lobbyID)

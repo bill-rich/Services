@@ -18,6 +18,7 @@
 
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using System.Net;
 using System.Text.Json;
 
@@ -65,11 +66,13 @@ namespace GenOnlineService.Controllers
 	/// game plays as it grows. Companion to the GameClient live-observer change.
 	/// </summary>
 	[ApiController]
+	[DisableRateLimiting] // the streamer posts once a second for the whole match; the built-in limiter budget is far smaller
 	[Route("env/{environment}/contract/{contract_version}/[controller]")]
 	public class LivestreamController : ControllerBase
 	{
 		private const int MaxChunkBytes = 512 * 1024;
 		private const int MaxReadBytes = 256 * 1024;
+		private const int MaxChunkRequestBytes = MaxChunkBytes * 4 / 3 + 4096; // base64 plus JSON framing
 
 		private readonly LivestreamManager _livestreams;
 		private readonly LobbyManager _lobbyManager;
@@ -116,6 +119,19 @@ namespace GenOnlineService.Controllers
 				return result;
 			}
 
+			// A player in the match must not be able to watch it from a second client and
+			// see the whole map a delay behind; the stream opens to them once it has ended.
+			if (!stream.Ended)
+			{
+				Int64 user_id = TokenHelper.GetUserID(this);
+				Lobby? lobby = _lobbyManager.GetLobby(lobbyID);
+				if (lobby != null && user_id != -1 && lobby.GetMemberFromUserID(user_id) != null)
+				{
+					Response.StatusCode = (int)HttpStatusCode.Forbidden;
+					return result;
+				}
+			}
+
 			result.success = true;
 			result.total = stream.Length;
 			result.available = stream.AvailableLength();
@@ -131,17 +147,39 @@ namespace GenOnlineService.Controllers
 
 		[HttpPost("{lobbyID}/chunk")]
 		[Authorize(Roles = "GameClient")]
+		[RequestSizeLimit(MaxChunkRequestBytes)]
 		public async Task<APIResult> PostChunk(Int64 lobbyID)
 		{
 			RouteHandler_POST_Livestream_Result result = new();
 
 			Int64 user_id = TokenHelper.GetUserID(this);
-			Lobby? lobby = _lobbyManager.GetLobby(lobbyID);
-			// Only the lobby owner streams, and only while the match is running. Every
-			// member records the same replay, so one copy is enough.
-			if (user_id == -1 || lobby == null || lobby.Owner != user_id || lobby.State != ELobbyState.INGAME)
+			if (user_id == -1)
 			{
 				Response.StatusCode = (int)HttpStatusCode.Unauthorized;
+				return result;
+			}
+
+			Livestream? existing = _livestreams.Get(lobbyID);
+			if (existing == null)
+			{
+				// Only the lobby owner starts a stream, only while the match is running, and
+				// only for a match that admits observers and is not passworded: a private
+				// game is not broadcast. Every member records the same replay, so one copy
+				// is enough.
+				Lobby? lobby = _lobbyManager.GetLobby(lobbyID);
+				if (lobby == null || lobby.Owner != user_id || lobby.State != ELobbyState.INGAME
+					|| !lobby.AllowObservers || lobby.IsPassworded)
+				{
+					Response.StatusCode = (int)HttpStatusCode.Unauthorized;
+					return result;
+				}
+			}
+			else if (existing.StreamerUserID != user_id)
+			{
+				// Once a stream exists its streamer may keep appending even after the lobby
+				// leaves INGAME, so the final chunks are not lost when the lobby completes first.
+				Response.StatusCode = (int)HttpStatusCode.Conflict;
+				result.total = existing.Length;
 				return result;
 			}
 
@@ -172,12 +210,21 @@ namespace GenOnlineService.Controllers
 				return result;
 			}
 
-			Livestream stream = _livestreams.GetOrCreate(lobbyID, user_id, lobby.Name, lobby.MapName, lobby.MapPath, lobby.GetNumberOfHumans());
-			if (stream.StreamerUserID != user_id)
+			Livestream stream;
+			if (existing != null)
 			{
-				Response.StatusCode = (int)HttpStatusCode.Conflict;
-				result.total = stream.Length;
-				return result;
+				stream = existing;
+			}
+			else
+			{
+				Lobby lobby = _lobbyManager.GetLobby(lobbyID)!;
+				stream = _livestreams.GetOrCreate(lobbyID, user_id, lobby.Name, lobby.MapName, lobby.MapPath, lobby.GetNumberOfHumans());
+				if (stream.StreamerUserID != user_id)
+				{
+					Response.StatusCode = (int)HttpStatusCode.Conflict;
+					result.total = stream.Length;
+					return result;
+				}
 			}
 
 			if (!stream.Append(offset, bytes, out long currentLength))
