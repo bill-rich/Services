@@ -30,6 +30,7 @@ using System.Net.WebSockets;
 using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 public class LatencyEntry
 {
 	public Int64 user_id { get; set; }
@@ -135,8 +136,22 @@ namespace GenOnlineService.Controllers
 		MAX_CAMERA_HEIGHT = 17,
         JOINABILITY = 18,
 		HOST_ACTION_BULK_SLOT_UPDATE = 19,
-		HOST_ACTION_ARM_RESUME = 20
+		HOST_ACTION_ARM_RESUME = 20,
+		LOCAL_PLAYER_HAS_RESUME_REPLAY = 21
     };
+
+	public class RouteHandler_ResumeReplay_Result : APIResult
+	{
+		public override Type GetReturnType()
+		{
+			return this.GetType();
+		}
+
+		public bool success { get; set; } = false;
+		public long total { get; set; } = 0;
+		public long from { get; set; } = 0;
+		public string data { get; set; } = String.Empty;
+	}
 
 	public class RouteHandler_PUT_Lobby_Result : APIResult
 	{
@@ -404,8 +419,16 @@ namespace GenOnlineService.Controllers
 			[ELobbyUpdateField.MAX_CAMERA_HEIGHT] = ELobbyUpdatePermissions.LobbyOwner,
 			[ELobbyUpdateField.JOINABILITY] = ELobbyUpdatePermissions.LobbyOwner,
 			[ELobbyUpdateField.HOST_ACTION_BULK_SLOT_UPDATE] = ELobbyUpdatePermissions.LobbyOwner,
-			[ELobbyUpdateField.HOST_ACTION_ARM_RESUME] = ELobbyUpdatePermissions.LobbyOwner
+			[ELobbyUpdateField.HOST_ACTION_ARM_RESUME] = ELobbyUpdatePermissions.LobbyOwner,
+			[ELobbyUpdateField.LOCAL_PLAYER_HAS_RESUME_REPLAY] = ELobbyUpdatePermissions.Anyone
 		};
+
+		// Resume-from-replay source transfer (see HOST_ACTION_ARM_RESUME): the host posts the file in
+		// base64 chunks, guests read it back in chunks. Replays are command logs, a long match is a few MB.
+		private const int ResumeReplayMaxChunkBytes = 512 * 1024;
+		private const int ResumeReplayMaxReadBytes = 256 * 1024;
+		private const int ResumeReplayMaxChunkRequestBytes = ResumeReplayMaxChunkBytes * 4 / 3 + 4096; // base64 plus JSON framing
+		private static readonly Regex ResumeReplayFileNamePattern = new Regex("^[0-9]{8}\\.rep$", RegexOptions.Compiled);
 
 
 		[HttpPost("{lobbyID}")]
@@ -469,6 +492,7 @@ namespace GenOnlineService.Controllers
 								// reset everyones ready states when anything changes (minus dummy actions)
 								if (field != ELobbyUpdateField.HOST_ACTION_FORCE_START
 									&& field != ELobbyUpdateField.LOCAL_PLAYER_HAS_MAP
+									&& field != ELobbyUpdateField.LOCAL_PLAYER_HAS_RESUME_REPLAY
 									&& field != ELobbyUpdateField.HOST_ACTION_KICK_USER)
 								{
 									lobby.ResetReadyStates();
@@ -741,17 +765,62 @@ namespace GenOnlineService.Controllers
 								}
 								else if (field == ELobbyUpdateField.HOST_ACTION_ARM_RESUME)
 								{
-									// Resume-from-replay: the host arms a replay every member holds a copy of.
-									// The client replays it in lockstep up to handoff_frame on game start, so the
-									// lobby must start from the replay's seed. An empty replay_file disarms.
-									if (data.ContainsKey("replay_file")
-										&& data.ContainsKey("handoff_frame")
-										&& data.ContainsKey("rng_seed"))
+									// Resume-from-replay: the host arms the resume source it uploaded (POST {lobbyID}/resume_replay).
+									// The client replays it in lockstep up to handoff_frame on game start, so the lobby
+									// must start from the replay's seed. handoff_frame 0 disarms. Every refusal is an
+									// explicit error: a client that announced an arm the service dropped would have
+									// every guest start a fresh match.
+									if (data.ContainsKey("replay_file"))
 									{
-										string replayFile = data["replay_file"].GetString() ?? String.Empty;
-										UInt32 handoffFrame = data["handoff_frame"].GetUInt32();
-										int rngSeed = data["rng_seed"].GetInt32();
-										lobby.UpdateResumeArm(replayFile, handoffFrame, rngSeed);
+										// legacy field from clients that still name the file: only the recorder's own name is acceptable
+										string? replayFile = data["replay_file"].ValueKind == JsonValueKind.String ? data["replay_file"].GetString() : null;
+										if (replayFile == null || (replayFile.Length > 0 && !ResumeReplayFileNamePattern.IsMatch(replayFile)))
+										{
+											Response.StatusCode = (int)HttpStatusCode.BadRequest;
+											result.success = false;
+											return result;
+										}
+									}
+									if (!data.ContainsKey("handoff_frame")
+										|| data["handoff_frame"].ValueKind != JsonValueKind.Number
+										|| !data["handoff_frame"].TryGetUInt32(out UInt32 handoffFrame))
+									{
+										Response.StatusCode = (int)HttpStatusCode.BadRequest;
+										result.success = false;
+										return result;
+									}
+									int rngSeed = 0;
+									if (handoffFrame != 0
+										&& (!data.ContainsKey("rng_seed")
+											|| data["rng_seed"].ValueKind != JsonValueKind.Number
+											|| !data["rng_seed"].TryGetInt32(out rngSeed)))
+									{
+										Response.StatusCode = (int)HttpStatusCode.BadRequest;
+										result.success = false;
+										return result;
+									}
+									if (!lobby.UpdateResumeArm(handoffFrame, rngSeed))
+									{
+										// arming without an uploaded source
+										Response.StatusCode = (int)HttpStatusCode.Conflict;
+										result.success = false;
+										return result;
+									}
+									result.success = true;
+								}
+								else if (field == ELobbyUpdateField.LOCAL_PLAYER_HAS_RESUME_REPLAY)
+								{
+									// whether this member holds a usable copy of the resume source (the way has_map works)
+									if (data.ContainsKey("has_resume_replay") && (data["has_resume_replay"].ValueKind == JsonValueKind.True || data["has_resume_replay"].ValueKind == JsonValueKind.False))
+									{
+										SourceMember.UpdateHasResumeReplay(data["has_resume_replay"].GetBoolean());
+										result.success = true;
+									}
+									else
+									{
+										Response.StatusCode = (int)HttpStatusCode.BadRequest;
+										result.success = false;
+										return result;
 									}
 								}
                             }
@@ -766,6 +835,116 @@ namespace GenOnlineService.Controllers
 				}
 			}
 
+			return result;
+		}
+
+		/// <summary>
+		/// Resume-from-replay source upload (lobby owner only). The file arrives in base64 chunks with an
+		/// offset; offset 0 starts a new file and replaces whatever the lobby held. The service keeps it
+		/// in memory with the lobby until the lobby is deleted.
+		/// </summary>
+		[HttpPost("{lobbyID}/resume_replay")]
+		[Authorize(Roles = "GameClient")]
+		[RequestSizeLimit(ResumeReplayMaxChunkRequestBytes)]
+		public async Task<APIResult> PostResumeReplay(Int64 lobbyID)
+		{
+			RouteHandler_ResumeReplay_Result result = new RouteHandler_ResumeReplay_Result();
+
+			Int64 user_id = TokenHelper.GetUserID(this);
+			Lobby? lobby = _lobbyManager.GetLobby(lobbyID);
+			if (lobby == null)
+			{
+				Response.StatusCode = (int)HttpStatusCode.NotFound;
+				return result;
+			}
+			if (user_id == -1 || lobby.Owner != user_id)
+			{
+				Response.StatusCode = (int)HttpStatusCode.Unauthorized;
+				return result;
+			}
+
+			long offset;
+			long total;
+			byte[] bytes;
+			try
+			{
+				using var reader = new StreamReader(HttpContext.Request.Body);
+				string jsonData = await reader.ReadToEndAsync();
+				var data = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(jsonData, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+				if (data == null || !data.ContainsKey("offset") || !data.ContainsKey("total") || !data.ContainsKey("data")
+					|| !data["offset"].TryGetInt64(out offset) || !data["total"].TryGetInt64(out total))
+				{
+					Response.StatusCode = (int)HttpStatusCode.BadRequest;
+					return result;
+				}
+				bytes = Convert.FromBase64String(data["data"].GetString() ?? String.Empty);
+			}
+			catch
+			{
+				Response.StatusCode = (int)HttpStatusCode.BadRequest;
+				return result;
+			}
+
+			if (bytes.Length == 0 || bytes.Length > ResumeReplayMaxChunkBytes || offset < 0 || total <= 0 || total > Lobby.ResumeReplayMaxBytes)
+			{
+				Response.StatusCode = (int)HttpStatusCode.BadRequest;
+				return result;
+			}
+
+			if (!lobby.AppendResumeReplay(offset, total, bytes, out long currentLength))
+			{
+				// offset disagreement (lost reply, duplicate send): tell the uploader where we really are
+				Response.StatusCode = (int)HttpStatusCode.Conflict;
+				result.total = currentLength;
+				return result;
+			}
+
+			result.success = true;
+			result.total = currentLength;
+			return result;
+		}
+
+		/// <summary>
+		/// Resume-from-replay source download (lobby members only), from the given byte offset.
+		/// </summary>
+		[HttpGet("{lobbyID}/resume_replay")]
+		[Authorize(Roles = "GameClient")]
+		public APIResult GetResumeReplay(Int64 lobbyID, [FromQuery] long from = 0)
+		{
+			RouteHandler_ResumeReplay_Result result = new RouteHandler_ResumeReplay_Result();
+
+			Int64 user_id = TokenHelper.GetUserID(this);
+			Lobby? lobby = _lobbyManager.GetLobby(lobbyID);
+			if (lobby == null)
+			{
+				Response.StatusCode = (int)HttpStatusCode.NotFound;
+				return result;
+			}
+			if (user_id == -1 || lobby.GetMemberFromUserID(user_id) == null)
+			{
+				Response.StatusCode = (int)HttpStatusCode.Unauthorized;
+				return result;
+			}
+			if (from < 0)
+			{
+				Response.StatusCode = (int)HttpStatusCode.BadRequest;
+				return result;
+			}
+
+			byte[] bytes = lobby.ReadResumeReplay(from, ResumeReplayMaxReadBytes, out long total);
+			if (total == 0)
+			{
+				Response.StatusCode = (int)HttpStatusCode.NotFound;
+				return result;
+			}
+
+			result.success = true;
+			result.total = total;
+			result.from = from;
+			if (bytes.Length > 0)
+			{
+				result.data = Convert.ToBase64String(bytes);
+			}
 			return result;
 		}
 

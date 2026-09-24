@@ -593,9 +593,20 @@ namespace GenOnlineService
 
 		public UInt16 MaximumCameraHeight { get; private set; } = GenOnlineService.Constants.g_DefaultCameraMaxHeight;
 
-		// Resume-from-replay arming (see HOST_ACTION_ARM_RESUME). Empty when not armed.
-		public string ResumeReplayFile { get; private set; } = String.Empty;
+		// Resume-from-replay arming (see HOST_ACTION_ARM_RESUME). 0 when not armed. Every client replays the
+		// same source, the host's upload (POST {lobbyID}/resume_replay), kept in memory with the lobby.
 		public UInt32 ResumeHandoffFrame { get; private set; } = 0;
+
+		public const long ResumeReplayMaxBytes = 16 * 1024 * 1024;
+
+		[JsonIgnore] // the file is served by its own endpoint
+		private byte[] m_resumeReplayBytes = Array.Empty<byte>();
+		[JsonIgnore]
+		private long m_resumeReplayLength = 0;
+		[JsonIgnore]
+		private long m_resumeReplayTotal = 0;
+		[JsonIgnore]
+		private readonly object m_resumeReplayLock = new object();
 
         [JsonIgnore] // This is not serialized as the client doesn't need to know, the service checks it
         public ELobbyJoinability LobbyJoinability { get; private set; } = ELobbyJoinability.Public; // public by default
@@ -1388,6 +1399,7 @@ public async Task FinalizeACChecks()
 				await Database.Users.SetFavorite_Map(_db, Owner, strMapPath);
 			}
 
+			ClearResumeArm(); // the recording fixes the map
 			DirtyRetransmitLobbyList();
 		}
 
@@ -1397,6 +1409,7 @@ public async Task FinalizeACChecks()
 
 			await Database.Users.SetFavorite_StartingMoney(_db, Owner, (int)newStartingCash);
 
+			ClearResumeArm(); // the recording fixes the starting cash
 			DirtyRetransmitLobbyList();
 		}
 
@@ -1406,6 +1419,7 @@ public async Task FinalizeACChecks()
 
 			await Database.Users.SetFavorite_LimitSuperweapons(_db, Owner, bLimitSuperweapons);
 
+			ClearResumeArm(); // the recording fixes the superweapon limit
 			DirtyRetransmitLobbyList();
 		}
 
@@ -1522,26 +1536,117 @@ public async Task FinalizeACChecks()
 			}
 		}
 
-		public void UpdateResumeArm(string replayFile, UInt32 handoffFrame, int rngSeed)
+		/// <summary>
+		/// Arms (handoff_frame != 0) or disarms the resume. Arming needs a completely uploaded source and
+		/// takes the replay's seed as the lobby seed; either way every member starts out not holding
+		/// the source (the host flags itself right after, guests after downloading).
+		/// </summary>
+		public bool UpdateResumeArm(UInt32 handoffFrame, int rngSeed)
 		{
-			if (replayFile.Length > 64)
+			if (handoffFrame == 0)
 			{
-				return; // replay names are short fixed-form file names, refuse anything else
+				ClearResumeArm();
+				return true;
 			}
 
-			if (replayFile.Length == 0)
+			lock (m_resumeReplayLock)
 			{
-				// disarm; the seed stays whatever it is, the next start is a fresh game
-				ResumeReplayFile = String.Empty;
-				ResumeHandoffFrame = 0;
+				if (m_resumeReplayLength == 0 || m_resumeReplayLength != m_resumeReplayTotal)
+				{
+					return false; // no source, or an unfinished upload
+				}
 			}
-			else
+
+			ResumeHandoffFrame = handoffFrame;
+			RNGSeed = rngSeed;
+			foreach (LobbyMember member in Members)
 			{
-				ResumeReplayFile = replayFile;
-				ResumeHandoffFrame = handoffFrame;
-				RNGSeed = rngSeed;
+				member.UpdateHasResumeReplay(false, false);
 			}
 			DirtyRetransmit();
+			return true;
+		}
+
+		/// <summary>
+		/// Disarms the resume and drops the source. Also called when the host changes a setting the
+		/// recording fixes (map, starting cash, superweapon limit): the arm cannot survive that.
+		/// </summary>
+		public void ClearResumeArm()
+		{
+			bool bWasArmed = ResumeHandoffFrame != 0;
+			ResumeHandoffFrame = 0;
+			lock (m_resumeReplayLock)
+			{
+				m_resumeReplayBytes = Array.Empty<byte>();
+				m_resumeReplayLength = 0;
+				m_resumeReplayTotal = 0;
+			}
+			foreach (LobbyMember member in Members)
+			{
+				member.UpdateHasResumeReplay(false, false);
+			}
+			if (bWasArmed)
+			{
+				DirtyRetransmit();
+			}
+		}
+
+		/// <summary>
+		/// Appends one chunk of the resume source. Offset 0 starts a new file of the given total size;
+		/// every later chunk must continue exactly where the previous one ended. Returns false with
+		/// the current length on an offset disagreement so the uploader can resume from there.
+		/// </summary>
+		public bool AppendResumeReplay(long offset, long total, byte[] bytes, out long currentLength)
+		{
+			lock (m_resumeReplayLock)
+			{
+				if (offset == 0)
+				{
+					if (total > ResumeReplayMaxBytes)
+					{
+						currentLength = m_resumeReplayLength;
+						return false;
+					}
+					m_resumeReplayBytes = new byte[total];
+					m_resumeReplayLength = 0;
+					m_resumeReplayTotal = total;
+					ResumeHandoffFrame = 0; // a new source invalidates any arm
+				}
+				if (offset != m_resumeReplayLength || total != m_resumeReplayTotal || offset + bytes.Length > m_resumeReplayTotal)
+				{
+					currentLength = m_resumeReplayLength;
+					return false;
+				}
+				Buffer.BlockCopy(bytes, 0, m_resumeReplayBytes, (int)offset, bytes.Length);
+				m_resumeReplayLength += bytes.Length;
+				currentLength = m_resumeReplayLength;
+				return true;
+			}
+		}
+
+		/// <summary>
+		/// Reads up to maxBytes of the resume source from the given offset. total is 0 when no complete
+		/// source is held.
+		/// </summary>
+		public byte[] ReadResumeReplay(long from, int maxBytes, out long total)
+		{
+			lock (m_resumeReplayLock)
+			{
+				if (m_resumeReplayLength == 0 || m_resumeReplayLength != m_resumeReplayTotal)
+				{
+					total = 0;
+					return Array.Empty<byte>();
+				}
+				total = m_resumeReplayTotal;
+				if (from >= total)
+				{
+					return Array.Empty<byte>();
+				}
+				int count = (int)Math.Min((long)maxBytes, total - from);
+				byte[] slice = new byte[count];
+				Buffer.BlockCopy(m_resumeReplayBytes, (int)from, slice, 0, count);
+				return slice;
+			}
 		}
 
 		public void ResetReadyStates()
@@ -1596,6 +1701,7 @@ public async Task FinalizeACChecks()
 		public int Color { get; private set; } = 0;
 		public int StartingPosition { get; private set; } = 0;
 		public bool HasMap { get; private set; } = false;
+		public bool HasResumeReplay { get; private set; } = false; // holds a usable copy of the resume-from-replay source
 
 		public EPlayerType SlotState { get; private set; } = 0;
 		public UInt16 SlotIndex { get; private set; } = 0;
@@ -1714,6 +1820,16 @@ public async Task FinalizeACChecks()
 			HasMap = bHasMap;
 
 			DirtyRetransmit();
+		}
+
+		public void UpdateHasResumeReplay(bool bHasResumeReplay, bool bRetransmit = true)
+		{
+			HasResumeReplay = bHasResumeReplay;
+
+			if (bRetransmit)
+			{
+				DirtyRetransmit();
+			}
 		}
 	}
 
