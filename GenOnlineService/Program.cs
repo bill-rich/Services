@@ -1147,6 +1147,7 @@ namespace GenOnlineService
 
 			builder.Services.AddHostedService<ExternalLeaderboardPublicationWorker>();
 			builder.Services.AddSingleton<LobbyManager>();
+			builder.Services.AddSingleton<LivestreamManager>();
 
 			var rateLimitingSettings = Program.g_Config.GetSection("RateLimiting");
 			bool bUseBuiltinRateLimiter = rateLimitingSettings.GetValue<bool>("use_builtin_ratelimiter"); // use built in Kestrel/dotnet rate limiting if you do not have a reverse proxy or other rate limiter in front of service
