@@ -36,6 +36,7 @@ namespace GenOnlineService
 		public string Name { get; private set; }
 		public string MapName { get; private set; }
 		public string MapPath { get; private set; }
+		public bool MapOfficial { get; private set; }
 		public int Players { get; private set; }
 		public DateTime TimeStarted { get; private set; } = DateTime.UtcNow;
 		public DateTime TimeLastActivity { get; private set; } = DateTime.UtcNow;
@@ -47,9 +48,10 @@ namespace GenOnlineService
 		// per chunk so a burst of frames does not leak early.
 		private readonly List<(long endOffset, DateTime arrived)> m_chunks = new();
 
-		public Livestream(Int64 lobbyID, Int64 streamerUserID, string name, string mapName, string mapPath, int players, int broadcastDelaySeconds)
+		public Livestream(Int64 lobbyID, Int64 streamerUserID, string name, string mapName, string mapPath, bool mapOfficial, int players, int broadcastDelaySeconds)
 		{
 			BroadcastDelaySeconds = broadcastDelaySeconds;
+			MapOfficial = mapOfficial;
 			LobbyID = lobbyID;
 			StreamerUserID = streamerUserID;
 			Name = name;
@@ -172,10 +174,10 @@ namespace GenOnlineService
 			return stream;
 		}
 
-		public Livestream GetOrCreate(Int64 lobbyID, Int64 streamerUserID, string name, string mapName, string mapPath, int players)
+		public Livestream GetOrCreate(Int64 lobbyID, Int64 streamerUserID, string name, string mapName, string mapPath, bool mapOfficial, int players)
 		{
 			Cleanup();
-			return m_streams.GetOrAdd(lobbyID, id => new Livestream(id, streamerUserID, name, mapName, mapPath, players, BroadcastDelaySeconds));
+			return m_streams.GetOrAdd(lobbyID, id => new Livestream(id, streamerUserID, name, mapName, mapPath, mapOfficial, players, BroadcastDelaySeconds));
 		}
 
 		public void Remove(Int64 lobbyID)

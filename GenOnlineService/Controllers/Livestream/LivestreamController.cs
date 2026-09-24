@@ -30,6 +30,7 @@ namespace GenOnlineService.Controllers
 		public string name { get; set; } = String.Empty;
 		public string map_name { get; set; } = String.Empty;
 		public string map_path { get; set; } = String.Empty;
+		public bool map_official { get; set; }
 		public int players { get; set; }
 		public long total_bytes { get; set; }
 		public int seconds_live { get; set; }
@@ -99,6 +100,7 @@ namespace GenOnlineService.Controllers
 					name = stream.Name,
 					map_name = stream.MapName,
 					map_path = stream.MapPath,
+					map_official = stream.MapOfficial,
 					players = stream.Players,
 					total_bytes = stream.Length,
 					seconds_live = (int)(now - stream.TimeStarted).TotalSeconds
@@ -218,7 +220,7 @@ namespace GenOnlineService.Controllers
 			else
 			{
 				Lobby lobby = _lobbyManager.GetLobby(lobbyID)!;
-				stream = _livestreams.GetOrCreate(lobbyID, user_id, lobby.Name, lobby.MapName, lobby.MapPath, lobby.GetNumberOfHumans());
+				stream = _livestreams.GetOrCreate(lobbyID, user_id, lobby.Name, lobby.MapName, lobby.MapPath, lobby.IsMapOfficial, lobby.GetNumberOfHumans());
 				if (stream.StreamerUserID != user_id)
 				{
 					Response.StatusCode = (int)HttpStatusCode.Conflict;
